@@ -1,0 +1,189 @@
+name: go-platform
+
+x-common-env: &common-env
+  RABBITMQ_URL: ${RABBITMQ_URL}
+  JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+  JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+  JWT_ISSUER: ${JWT_ISSUER}
+  ACCESS_TOKEN_TTL: ${ACCESS_TOKEN_TTL}
+  REFRESH_TOKEN_TTL: ${REFRESH_TOKEN_TTL}
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: apps/gateway/Dockerfile
+    environment:
+      <<: *common-env
+      APP_PORT: ${GATEWAY_PORT}
+      AUTH_SERVICE_URL: http://auth-service:${AUTH_PORT}
+      CATALOG_SERVICE_URL: http://catalog-service:${CATALOG_PORT}
+      ORDER_SERVICE_URL: http://order-service:${ORDER_PORT}
+    ports:
+      - "${GATEWAY_PORT}:${GATEWAY_PORT}"
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      catalog-service:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+    networks: [backend]
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: apps/auth-service/Dockerfile
+    environment:
+      <<: *common-env
+      APP_PORT: ${AUTH_PORT}
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:${POSTGRES_PORT}/auth_db?sslmode=disable
+      REDIS_ADDR: ${REDIS_ADDR}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:${AUTH_PORT}/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [backend]
+
+  catalog-service:
+    build:
+      context: .
+      dockerfile: apps/catalog-service/Dockerfile
+    environment:
+      <<: *common-env
+      APP_PORT: ${CATALOG_PORT}
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:${POSTGRES_PORT}/catalog_db?sslmode=disable
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:${CATALOG_PORT}/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [backend]
+
+  order-service:
+    build:
+      context: .
+      dockerfile: apps/order-service/Dockerfile
+    environment:
+      <<: *common-env
+      APP_PORT: ${ORDER_PORT}
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:${POSTGRES_PORT}/order_db?sslmode=disable
+      CATALOG_SERVICE_URL: http://catalog-service:${CATALOG_PORT}
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:${ORDER_PORT}/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [backend]
+
+  notification-worker:
+    build:
+      context: .
+      dockerfile: apps/notification-worker/Dockerfile
+    environment:
+      <<: *common-env
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+    restart: unless-stopped
+    networks: [backend]
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deployments/postgres/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    networks: [backend]
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    networks: [backend]
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: app_password
+    ports:
+      - "15672:15672"
+      - "5672:5672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    networks: [backend]
+
+  migrations-up:
+    image: gomicro/goose:3.24.1
+    profiles: [tools]
+    depends_on:
+      postgres: { condition: service_healthy }
+    volumes:
+      - ./apps/auth-service/migrations:/migrations/auth:ro
+      - ./apps/catalog-service/migrations:/migrations/catalog:ro
+      - ./apps/order-service/migrations:/migrations/order:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "goose -dir /migrations/auth postgres 'postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:${POSTGRES_PORT}/auth_db?sslmode=disable' up &&
+       goose -dir /migrations/catalog postgres 'postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:${POSTGRES_PORT}/catalog_db?sslmode=disable' up &&
+       goose -dir /migrations/order postgres 'postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:${POSTGRES_PORT}/order_db?sslmode=disable' up"
+    networks: [backend]
+
+  migrations-down:
+    image: gomicro/goose:3.24.1
+    profiles: [tools]
+    depends_on:
+      postgres: { condition: service_healthy }
+    volumes:
+      - ./apps/auth-service/migrations:/migrations/auth:ro
+      - ./apps/catalog-service/migrations:/migrations/catalog:ro
+      - ./apps/order-service/migrations:/migrations/order:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "goose -dir /migrations/order postgres 'postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:${POSTGRES_PORT}/order_db?sslmode=disable' down &&
+       goose -dir /migrations/catalog postgres 'postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:${POSTGRES_PORT}/catalog_db?sslmode=disable' down &&
+       goose -dir /migrations/auth postgres 'postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:${POSTGRES_PORT}/auth_db?sslmode=disable' down"
+    networks: [backend]
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+
+networks:
+  backend:
+    driver: bridge

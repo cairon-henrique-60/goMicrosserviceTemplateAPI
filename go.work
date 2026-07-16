@@ -1,0 +1,10 @@
+go 1.23
+
+use (
+	./apps/auth-service
+	./apps/catalog-service
+	./apps/gateway
+	./apps/notification-worker
+	./apps/order-service
+	./pkg/platform
+)
